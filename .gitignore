@@ -1,0 +1,11 @@
+/bin/
+/obj/
+/.dotnet/
+/.local/
+/starter-*/
+/generator/
+/dev/
+/dev-answer/
+/out/
+*.zip
+__pycache__/
