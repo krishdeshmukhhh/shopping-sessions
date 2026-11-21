@@ -37,7 +37,7 @@ jobs:
           done
       - name: Time fresh processes on generated data
         run: |
-          bench/generator/target/release/generate --seed 39 --events 10000000 --clicks 2500000 --output /tmp/perf
+          bench/generator/target/release/generate --seed 39 --events 20000000 --clicks 5000000 --output /tmp/perf
           export NCPU=$(nproc)
           for bin in scored new aot aot new scored scored new aot; do
             /usr/bin/time -f "$bin wall=%e peak=%M" /tmp/$bin-bin/shopping-sessions /tmp/perf /tmp/perf-$bin
