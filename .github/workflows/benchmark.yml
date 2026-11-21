@@ -1,0 +1,47 @@
+name: Linux pipeline benchmark
+on:
+  push:
+    branches: [benchmark/linux-generator]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_TieredCompilation: '0'
+      DOTNET_EnableDiagnostics: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build generator and both implementations
+        run: |
+          git worktree add /tmp/scored dc46ba53e5e139250867edf80a68742cc221f641
+          cargo build --manifest-path bench/generator/Cargo.toml --release
+          dotnet publish /tmp/scored/Pipeline.csproj -c Release -o /tmp/scored-bin
+          dotnet publish Pipeline.csproj -c Release -o /tmp/new-bin
+          dotnet publish Pipeline.csproj -r linux-x64 -c Release -p:PublishAot=true -p:OptimizationPreference=Speed -o /tmp/aot-bin
+          python3 -m venv /tmp/verify
+          /tmp/verify/bin/pip install polars
+      - name: Check the public development answers
+        run: |
+          bench/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev
+          for bin in scored new aot; do
+            /tmp/$bin-bin/shopping-sessions /tmp/dev /tmp/out-$bin
+            /tmp/verify/bin/python bench/verify.py /tmp/out-$bin 4bf6dfb05c21ae3b705282923ddf9e2ea97a468838382e6a8e65e4d4a85e0aec 03d258f9657fb43641b17c75e4566ba8138027f979b8d627ab9669fca9657f68
+          done
+      - name: Time fresh processes on generated data
+        run: |
+          bench/generator/target/release/generate --seed 39 --events 10000000 --clicks 2500000 --output /tmp/perf
+          export NCPU=$(nproc)
+          for bin in scored new aot aot new scored scored new aot; do
+            /usr/bin/time -f "$bin wall=%e peak=%M" /tmp/$bin-bin/shopping-sessions /tmp/perf /tmp/perf-$bin
+          done
+          for bin in scored new aot; do /tmp/verify/bin/python bench/verify.py /tmp/perf-$bin > /tmp/results-$bin; done
+          diff /tmp/results-scored /tmp/results-new
+          diff /tmp/results-scored /tmp/results-aot
