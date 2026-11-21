@@ -25,13 +25,14 @@ jobs:
           cargo build --manifest-path bench/generator/Cargo.toml --release
           dotnet publish /tmp/scored/Pipeline.csproj -c Release -o /tmp/scored-bin
           dotnet publish Pipeline.csproj -c Release -o /tmp/new-bin
-          dotnet publish Pipeline.csproj -r linux-x64 -c Release -p:PublishAot=true -p:OptimizationPreference=Speed -o /tmp/aot-bin
+          mkdir -p /tmp/native-bin
+          g++ -std=c++20 -O3 -mavx2 -mbmi2 -mpopcnt -pthread native/main.cpp -o /tmp/native-bin/shopping-sessions
           python3 -m venv /tmp/verify
           /tmp/verify/bin/pip install polars
       - name: Check the public development answers
         run: |
           bench/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev
-          for bin in scored new aot; do
+          for bin in scored new native; do
             /tmp/$bin-bin/shopping-sessions /tmp/dev /tmp/out-$bin
             /tmp/verify/bin/python bench/verify.py /tmp/out-$bin 4bf6dfb05c21ae3b705282923ddf9e2ea97a468838382e6a8e65e4d4a85e0aec 03d258f9657fb43641b17c75e4566ba8138027f979b8d627ab9669fca9657f68
           done
@@ -39,9 +40,29 @@ jobs:
         run: |
           bench/generator/target/release/generate --seed 39 --events 20000000 --clicks 5000000 --output /tmp/perf
           export NCPU=$(nproc)
-          for bin in scored new aot aot new scored scored new aot; do
+          for bin in scored new native native new scored scored new native; do
             /usr/bin/time -f "$bin wall=%e peak=%M" /tmp/$bin-bin/shopping-sessions /tmp/perf /tmp/perf-$bin
           done
-          for bin in scored new aot; do /tmp/verify/bin/python bench/verify.py /tmp/perf-$bin > /tmp/results-$bin; done
+          for bin in scored new native; do /tmp/verify/bin/python bench/verify.py /tmp/perf-$bin > /tmp/results-$bin; done
           diff /tmp/results-scored /tmp/results-new
-          diff /tmp/results-scored /tmp/results-aot
+          diff /tmp/results-scored /tmp/results-native
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile the generator and pipeline for local fixtures
+        shell: pwsh
+        run: |
+          cargo build --manifest-path bench/generator/Cargo.toml --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          g++ -std=c++20 -O3 -mavx2 -mbmi2 -mpopcnt -static native/main.cpp -o pipeline.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item bench/generator/target/release/generate.exe .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-local-checks
+          path: |
+            pipeline.exe
+            generate.exe
+          retention-days: 2
