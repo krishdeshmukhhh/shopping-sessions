@@ -3,23 +3,24 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 
-readonly record struct RawEvent(ulong Id, ulong Person, long Time, long Ingest, int Price, int Category);
+readonly record struct Candidate(ulong Id, long Ingest, int Shard, int Index);
 readonly record struct Event(ulong Person, long Time, int Price, int Category);
 readonly record struct Click(ulong Person, long Time, ulong Id, int Campaign);
 readonly record struct UserDay(ulong Person, int Day, long Sessions, long Events, long Revenue, int Category);
 readonly record struct CampaignDay(int Campaign, int Day, long Sessions, long Purchases, long Revenue, long Assists);
 
-sealed class Links
+sealed class Links(int capacity)
 {
-    private readonly Dictionary<ulong, int> index = [];
-    private readonly List<int> parent = [], sizes = [];
-    private readonly List<ulong> minimum = [];
+    private readonly Dictionary<ulong, int> index = new(capacity);
+    private readonly List<int> parent = new(capacity), sizes = new(capacity);
+    private readonly List<ulong> minimum = new(capacity);
 
     private int Add(ulong key)
     {
-        if (index.TryGetValue(key, out int i)) return i;
-        i = parent.Count;
-        index.Add(key, i);
+        ref int entry = ref CollectionsMarshal.GetValueRefOrAddDefault(index, key, out bool exists);
+        if (exists) return entry;
+        int i = parent.Count;
+        entry = i;
         parent.Add(i);
         sizes.Add(1);
         minimum.Add(key);
@@ -43,13 +44,14 @@ sealed class Links
         if (sizes[left] < sizes[right]) (left, right) = (right, left);
         parent[right] = left;
         sizes[left] += sizes[right];
+        sizes[right] = 0;
         if (keys.Compare(minimum[right], minimum[left]) < 0)
             minimum[left] = minimum[right];
     }
 
     public Dictionary<ulong, ulong> Finish()
     {
-        var result = new Dictionary<ulong, ulong>(index.Count);
+        var result = new Dictionary<ulong, ulong>(index.Count - sizes.Count(n => n > 0));
         foreach (var (key, i) in index)
         {
             ulong person = minimum[Root(i)];
@@ -66,7 +68,6 @@ sealed class Pipeline(string data, string output, int cpus)
     private readonly Keys keys = new();
     private readonly List<ulong> categories = [];
     private readonly List<(ulong Id, ulong Channel)> campaigns = [];
-    private Dictionary<ulong, ulong> people = null!;
     private Dictionary<ulong, int> products = null!, campaignIds = null!;
     private long start, end;
 
@@ -82,11 +83,11 @@ sealed class Pipeline(string data, string output, int cpus)
     {
         Input.ReadFiles(files, new ParallelOptions { MaxDegreeOfParallelism = 1 }, (chunk, _) =>
         {
-            Span<Range> fields = stackalloc Range[2];
+            Span<Field> fields = stackalloc Field[2];
             while (!chunk.IsEmpty)
             {
                 var row = Input.Line(ref chunk);
-                if (Input.Fields(row, fields)) use(row[fields[0]], row[fields[1]]);
+                if (Input.Fields(row, fields)) use(fields[0].Get(row), fields[1].Get(row));
             }
         });
     }
@@ -96,13 +97,6 @@ sealed class Pipeline(string data, string output, int cpus)
         using var manifest = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(data, "manifest.json")));
         start = manifest.RootElement.GetProperty("window_start").GetDateTimeOffset().ToUnixTimeMilliseconds();
         end = manifest.RootElement.GetProperty("window_end").GetDateTimeOffset().ToUnixTimeMilliseconds();
-
-        var links = new Links();
-        Pairs(Files("links"), (a, b) =>
-        {
-            if (!a.IsEmpty && !b.IsEmpty) links.Join(keys.Encode(a), keys.Encode(b), keys);
-        });
-        people = links.Finish();
 
         products = [];
         categories.Add(keys.Encode("unknown"u8));
@@ -130,11 +124,16 @@ sealed class Pipeline(string data, string output, int cpus)
         });
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private ulong Person(ReadOnlySpan<byte> field)
+    private Dictionary<ulong, ulong> LoadLinks()
     {
-        ulong key = keys.Encode(field);
-        return people.GetValueOrDefault(key, key);
+        var files = Files("links").ToArray();
+        int estimate = (int)Math.Min(8_000_000, files.Sum(path => new FileInfo(path).Length) / 12);
+        var links = new Links(estimate);
+        Pairs(files, (a, b) =>
+        {
+            if (!a.IsEmpty && !b.IsEmpty) links.Join(keys.Encode(a), keys.Encode(b), keys);
+        });
+        return links.Finish();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -149,83 +148,134 @@ sealed class Pipeline(string data, string output, int cpus)
 
     private static int Shard(ulong key) => (int)(Hash(key) & (ShardCount - 1));
 
-    private static List<T>[] Buckets<T>() =>
-        Enumerable.Range(0, ShardCount).Select(_ => new List<T>()).ToArray();
+    private static List<T>[] Buckets<T>() => Buckets<T>(0);
 
-    private List<Event>[][] LoadEvents()
+    private static List<T>[] Buckets<T>(int capacity) =>
+        Enumerable.Range(0, ShardCount).Select(_ => new List<T>(capacity)).ToArray();
+
+    private sealed class EventBuffers(int capacity)
     {
-        var outputBuckets = new List<Event>[ShardCount][];
-        using var raw = new ThreadLocal<List<RawEvent>[]>(Buckets<RawEvent>, trackAllValues: true);
-        Input.ReadFiles(Files("events"), parallel, (chunk, _) => ParseEvents(chunk, raw.Value!));
-        var inputs = raw.Values;
-
-        Parallel.For(0, ShardCount, parallel, shard =>
-        {
-            var buckets = Buckets<Event>();
-            outputBuckets[shard] = buckets;
-            int count = inputs.Sum(source => source[shard].Count);
-            if (count == 0) return;
-
-            var unique = new RawEvent[count];
-            var slots = new int[BitOperations.RoundUpToPowerOf2((uint)(count + count / 2 + 1))];
-            int used = 0;
-            foreach (var source in inputs)
-            {
-                foreach (var row in source[shard])
-                {
-                    int slot = (int)((Hash(row.Id) >> 6) & (uint)(slots.Length - 1));
-                    while (slots[slot] != 0 && unique[slots[slot] - 1].Id != row.Id)
-                        slot = (slot + 1) & (slots.Length - 1);
-                    int current = slots[slot] - 1;
-                    if (current < 0)
-                    {
-                        unique[used] = row;
-                        slots[slot] = ++used;
-                    }
-                    else if (row.Ingest < unique[current].Ingest)
-                        unique[current] = row;
-                }
-                source[shard] = null!;
-            }
-            foreach (ref readonly var row in unique.AsSpan(0, used))
-                if (row.Person != 0)
-                    buckets[Shard(row.Person)].Add(new Event(row.Person, row.Time, row.Price, row.Category));
-        });
-        return outputBuckets;
+        public readonly List<Event>[] People = Buckets<Event>(capacity);
+        public readonly List<Candidate>[] Ids = Buckets<Candidate>(capacity);
     }
 
-    private void ParseEvents(ReadOnlySpan<byte> chunk, List<RawEvent>[] buckets)
+    private readonly record struct Winner(ulong Id, int Worker, int Index);
+
+    private IList<List<Event>[]> LoadEvents(Action loadLinks)
     {
-        Span<Range> fields = stackalloc Range[7];
+        var files = Files("events").ToArray();
+        long bytes = files.Sum(path => new FileInfo(path).Length);
+        int capacity = (int)Math.Min(262144, bytes / (72L * cpus * ShardCount));
+        using var local = new ThreadLocal<EventBuffers>(() => new EventBuffers(capacity), true);
+        Input.ReadFiles(files, parallel, (chunk, _) => ParseEvents(chunk, local.Value!), loadLinks);
+        var workers = local.Values;
+
+        // Events already reside in person partitions. Only duplicates need
+        // a write to those partitions once all parser threads have finished.
+        Parallel.For(0, ShardCount, parallel, shard =>
+        {
+            int count = workers.Sum(worker => worker.Ids[shard].Count);
+            if (count == 0) return;
+            // Repeated hash positions include every duplicate ID. Resolve their
+            // full IDs in a smaller table, allowing singleton positions to pass.
+            int bits = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(64, count * 12));
+            var seen = new ulong[bits / 64];
+            var repeated = new ulong[bits / 64];
+            int candidates = 0;
+            foreach (var worker in workers)
+            {
+                foreach (ref readonly var row in CollectionsMarshal.AsSpan(worker.Ids[shard]))
+                {
+                    int bit = (int)((Hash(row.Id) >> 6) & (uint)(bits - 1));
+                    ulong flag = 1UL << bit;
+                    ref ulong word = ref seen[bit >> 6];
+                    if ((word & flag) != 0)
+                    {
+                        ref ulong collisions = ref repeated[bit >> 6];
+                        if ((collisions & flag) == 0) candidates++;
+                        candidates++;
+                        collisions |= flag;
+                    }
+                    word |= flag;
+                }
+            }
+            var slots = new Winner[BitOperations.RoundUpToPowerOf2((uint)(candidates + candidates / 2 + 1))];
+            for (int w = 0; w < workers.Count; w++)
+            {
+                var rows = CollectionsMarshal.AsSpan(workers[w].Ids[shard]);
+                for (int i = 0; i < rows.Length; i++)
+                {
+                    ref readonly var row = ref rows[i];
+                    ulong hash = Hash(row.Id) >> 6;
+                    int bit = (int)(hash & (uint)(bits - 1));
+                    if ((repeated[bit >> 6] & (1UL << bit)) == 0) continue;
+                    int slot = (int)((hash ^ (hash >> 19)) & (uint)(slots.Length - 1));
+                    while (slots[slot].Id != 0 && slots[slot].Id != row.Id)
+                        slot = (slot + 1) & (slots.Length - 1);
+                    ref var winner = ref slots[slot];
+                    if (winner.Id != 0)
+                    {
+                        var previousWorker = workers[winner.Worker];
+                        var previous = previousWorker.Ids[shard][winner.Index];
+                        if (previous.Ingest <= row.Ingest)
+                        {
+                            Invalidate(workers[w], row);
+                            continue;
+                        }
+                        Invalidate(previousWorker, previous);
+                    }
+                    winner = new Winner(row.Id, w, i);
+                }
+            }
+            foreach (var worker in workers) worker.Ids[shard] = null!;
+        });
+        return workers.Select(worker => worker.People).ToArray();
+    }
+
+    private static void Invalidate(EventBuffers worker, Candidate row)
+    {
+        if (row.Index >= 0) CollectionsMarshal.AsSpan(worker.People[row.Shard])[row.Index] = default;
+    }
+
+    private void ParseEvents(ReadOnlySpan<byte> chunk, EventBuffers buffers)
+    {
+        Span<Field> fields = stackalloc Field[7];
         while (!chunk.IsEmpty)
         {
-            var row = Input.Line(ref chunk);
-            if (!Input.Fields(row, fields) || row[fields[0]].IsEmpty) continue;
-            ulong id = keys.Encode(row[fields[0]]);
-            long ingest = Input.IngestTimestamp(row[fields[3]]);
-            long time = Input.Timestamp(row[fields[2]]);
+            if (!Input.ReadRow(ref chunk, fields, out var row) || fields[0].Get(row).IsEmpty) continue;
+            ulong id = keys.Encode(fields[0].Get(row));
+            long ingest = Input.IngestTimestamp(fields[3].Get(row));
+            long time = Input.Timestamp(fields[2].Get(row));
             ulong person = 0;
             int price = 0, category = 0;
 
             if (time >= start && time < end && ingest - time <= Input.Day &&
-                !row[fields[1]].IsEmpty && !row[fields[5]].IsEmpty)
+                !fields[1].Get(row).IsEmpty && !fields[5].Get(row).IsEmpty)
             {
-                var type = row[fields[4]];
+                var type = fields[4].Get(row);
                 if (type.SequenceEqual("view"u8) || type.SequenceEqual("cart"u8))
-                    person = Person(row[fields[1]]);
+                    person = keys.Encode(fields[1].Get(row));
                 else if (type.SequenceEqual("purchase"u8))
                 {
-                    long amount = Input.Number(row[fields[6]]);
+                    long amount = Input.Number(fields[6].Get(row));
                     if (amount is >= 1 and <= 10_000_000)
                     {
-                        person = Person(row[fields[1]]);
+                        person = keys.Encode(fields[1].Get(row));
                         price = (int)amount;
-                        category = products.GetValueOrDefault(keys.Encode(row[fields[5]]));
+                        category = products.GetValueOrDefault(keys.Encode(fields[5].Get(row)));
                     }
                 }
             }
             // Invalid candidates still participate in deduplication as tombstones.
-            buckets[Shard(id)].Add(new RawEvent(id, person, time, ingest, price, category));
+            int shard = Shard(person);
+            int index = -1;
+            if (person != 0)
+            {
+                var events = buffers.People[shard];
+                index = events.Count;
+                events.Add(new Event(person, time, price, category));
+            }
+            buffers.Ids[Shard(id)].Add(new Candidate(id, ingest, shard, index));
         }
     }
 
@@ -235,18 +285,17 @@ sealed class Pipeline(string data, string output, int cpus)
         Input.ReadFiles(Files("clicks"), parallel, (chunk, _) =>
         {
             var buckets = clicks.Value!;
-            Span<Range> fields = stackalloc Range[4];
+            Span<Field> fields = stackalloc Field[4];
             while (!chunk.IsEmpty)
             {
-                var row = Input.Line(ref chunk);
-                if (!Input.Fields(row, fields) || row[fields[0]].IsEmpty || row[fields[1]].IsEmpty ||
-                    !campaignIds.TryGetValue(keys.Encode(row[fields[2]]), out int campaign))
+                if (!Input.ReadRow(ref chunk, fields, out var row) || fields[0].Get(row).IsEmpty || fields[1].Get(row).IsEmpty ||
+                    !campaignIds.TryGetValue(keys.Encode(fields[2].Get(row)), out int campaign))
                     continue;
-                long time = Input.Timestamp(row[fields[3]]);
+                long time = Input.Timestamp(fields[3].Get(row));
                 if (time < start - Input.Week || time >= end) continue;
-                ulong person = Person(row[fields[1]]);
+                ulong person = keys.Encode(fields[1].Get(row));
                 // Identical click copies leave the winning click and the set of assists unchanged.
-                buckets[Shard(person)].Add(new Click(person, time, keys.Encode(row[fields[0]]), campaign));
+                buckets[Shard(person)].Add(new Click(person, time, keys.Encode(fields[0].Get(row)), campaign));
             }
         });
         return clicks.Values;
@@ -255,25 +304,60 @@ sealed class Pipeline(string data, string output, int cpus)
     public void Run()
     {
         LoadDimensions();
-        var eventBuckets = LoadEvents();
+        Dictionary<ulong, ulong> links = null!;
+        var eventBuckets = LoadEvents(() => links = LoadLinks());
         var clickBuckets = LoadClicks();
         var totals = new Dictionary<(int Campaign, int Day), CampaignDay>[ShardCount];
+        var grouped = new List<AliasRows>[ShardCount][];
         Directory.CreateDirectory(Path.Combine(output, "user_daily"));
         Directory.CreateDirectory(Path.Combine(output, "campaign_daily"));
 
         Parallel.For(0, ShardCount, parallel, shard =>
         {
-            var events = Combine(eventBuckets, shard);
-            var clicks = Combine(clickBuckets, shard);
-            CollectionsMarshal.AsSpan(events).Sort(new EventOrder());
-            CollectionsMarshal.AsSpan(clicks).Sort(new ClickOrder(keys));
+            var rawIds = new Dictionary<ulong, int>();
+            var events = Group(eventBuckets, shard, new EventOrder(), rawIds);
+            var clicks = Group(clickBuckets, shard, new ClickOrder(keys), rawIds);
+            if (links.Count == 0)
+            {
+                var rows = new List<AliasRows>(rawIds.Count);
+                foreach (var (id, index) in rawIds)
+                    rows.Add(new AliasRows(id, events.Segment(index), clicks.Segment(index)));
+                WriteShard(shard, rows);
+                return;
+            }
 
+            var partitions = Buckets<AliasRows>();
+            grouped[shard] = partitions;
+            foreach (var (id, index) in rawIds)
+            {
+                ulong person = links.GetValueOrDefault(id, id);
+                partitions[Shard(person)].Add(new AliasRows(person, events.Segment(index), clicks.Segment(index)));
+            }
+        });
+
+        if (links.Count > 0)
+        {
+            Parallel.For(0, ShardCount, parallel, shard =>
+            {
+                var aliases = new List<AliasRows>(grouped.Sum(parts => parts[shard].Count));
+                foreach (var parts in grouped)
+                {
+                    aliases.AddRange(parts[shard]);
+                    parts[shard] = null!;
+                }
+                aliases.Sort(static (a, b) => a.Person.CompareTo(b.Person));
+                WriteShard(shard, aliases);
+            });
+        }
+
+        void WriteShard(int shard, List<AliasRows> aliases)
+        {
             var counts = new Dictionary<(int Campaign, int Day), CampaignDay>();
             totals[shard] = counts;
-            var users = Sessionize(events, clicks, counts);
+            var users = Sessionize(aliases, counts);
             if (users.Count > 0 || shard == 0)
                 WriteUsers(Path.Combine(output, "user_daily", $"part-{shard:D2}.parquet"), users);
-        });
+        }
 
         var combined = new Dictionary<(int Campaign, int Day), CampaignDay>();
         foreach (var shard in totals)
@@ -282,54 +366,141 @@ sealed class Pipeline(string data, string output, int cpus)
         WriteCampaigns(Path.Combine(output, "campaign_daily", "part-00.parquet"), combined.Values.ToArray());
     }
 
-    private readonly struct EventOrder : IComparer<Event>
+    private interface IPersonOrder<T> : IComparer<T>
     {
-        public int Compare(Event a, Event b) =>
-            a.Person == b.Person ? a.Time.CompareTo(b.Time) : a.Person.CompareTo(b.Person);
+        ulong Person(T row);
     }
 
-    private readonly struct ClickOrder(Keys keys) : IComparer<Click>
+    private readonly struct EventOrder : IPersonOrder<Event>
     {
+        public ulong Person(Event row) => row.Person;
+        public int Compare(Event a, Event b) => a.Time.CompareTo(b.Time);
+    }
+
+    private readonly struct ClickOrder(Keys keys) : IPersonOrder<Click>
+    {
+        public ulong Person(Click row) => row.Person;
         public int Compare(Click a, Click b)
         {
-            if (a.Person != b.Person) return a.Person.CompareTo(b.Person);
             if (a.Time != b.Time) return a.Time.CompareTo(b.Time);
-            // The sweep takes the final eligible click, so the smallest ID sorts last on a tie.
             return keys.Compare(b.Id, a.Id);
         }
     }
 
-    private static List<T> Combine<T>(IEnumerable<List<T>[]> sources, int shard)
+    private readonly record struct AliasRows(ulong Person, ArraySegment<Event> Events, ArraySegment<Click> Clicks);
+
+    private readonly record struct Groups<T>(T[] Rows, int[] Ends)
     {
-        var rows = new List<T>(sources.Sum(source => source[shard].Count));
-        foreach (var source in sources)
+        public ArraySegment<T> Segment(int group)
         {
-            rows.AddRange(source[shard]);
-            source[shard] = null!;
+            if (group >= Ends.Length) return ArraySegment<T>.Empty;
+            int start = group == 0 ? 0 : Ends[group - 1];
+            return new ArraySegment<T>(Rows, start, Ends[group] - start);
         }
-        return rows;
     }
 
-    private List<UserDay> Sessionize(List<Event> events, List<Click> clicks,
+    private static Groups<T> Group<T, TOrder>(IEnumerable<List<T>[]> sources, int shard,
+        TOrder order, Dictionary<ulong, int> people) where TOrder : struct, IPersonOrder<T>
+    {
+        int count = sources.Sum(s => s[shard].Count);
+        var counts = new List<int>(people.Count);
+        CollectionsMarshal.SetCount(counts, people.Count);
+        var groups = GC.AllocateUninitializedArray<int>(count);
+        int position = 0;
+        foreach (var source in sources)
+        {
+            foreach (var row in CollectionsMarshal.AsSpan(source[shard]))
+            {
+                ulong person = order.Person(row);
+                int group;
+                if (person == 0) group = -1;
+                else
+                {
+                    ref int entry = ref CollectionsMarshal.GetValueRefOrAddDefault(people, person, out bool exists);
+                    if (!exists)
+                    {
+                        entry = counts.Count;
+                        counts.Add(0);
+                    }
+                    group = entry;
+                }
+                groups[position++] = group;
+                if (group >= 0) CollectionsMarshal.AsSpan(counts)[group]++;
+            }
+        }
+
+        var offsets = new int[counts.Count];
+        position = 0;
+        for (int group = 0; group < counts.Count; group++)
+        {
+            offsets[group] = position;
+            position += counts[group];
+        }
+
+        var rows = GC.AllocateUninitializedArray<T>(position);
+        position = 0;
+        foreach (var source in sources)
+        {
+            foreach (var row in CollectionsMarshal.AsSpan(source[shard]))
+            {
+                int group = groups[position++];
+                if (group >= 0) rows[offsets[group]++] = row;
+            }
+            source[shard] = null!;
+        }
+        return new Groups<T>(rows, offsets);
+    }
+
+    private List<UserDay> Sessionize(List<AliasRows> aliases,
         Dictionary<(int Campaign, int Day), CampaignDay> totals)
     {
+        Event[] eventScratch = [];
+        Click[] clickScratch = [];
         var users = new List<UserDay>();
         var categoryRevenue = new long[categories.Count];
         var usedCategories = new List<int>();
         var active = new Dictionary<int, int>();
-        int i = 0, first = 0, next = 0;
-
-        while (i < events.Count)
+        int group = 0;
+        var clickOrder = new ClickOrder(keys);
+        while (group < aliases.Count)
         {
-            var initial = events[i];
-            ulong person = initial.Person;
+            int begin = group;
+            var alias = aliases[group++];
+            ulong person = alias.Person;
+            int eventEnd = alias.Events.Count, clickEnd = alias.Clicks.Count;
+            while (group < aliases.Count && aliases[group].Person == person)
+            {
+                eventEnd += aliases[group].Events.Count;
+                clickEnd += aliases[group++].Clicks.Count;
+            }
+            if (eventEnd == 0) continue;
+            Span<Event> events = alias.Events.AsSpan();
+            Span<Click> clicks = alias.Clicks.AsSpan();
+            if (group - begin > 1)
+            {
+                if (eventScratch.Length < eventEnd) eventScratch = new Event[eventEnd];
+                if (clickScratch.Length < clickEnd) clickScratch = new Click[clickEnd];
+                events = eventScratch.AsSpan(0, eventEnd);
+                clicks = clickScratch.AsSpan(0, clickEnd);
+                int e = 0, c = 0;
+                for (int j = begin; j < group; j++)
+                {
+                    var part = aliases[j];
+                    part.Events.AsSpan().CopyTo(events[e..]);
+                    part.Clicks.AsSpan().CopyTo(clicks[c..]);
+                    e += part.Events.Count;
+                    c += part.Clicks.Count;
+                }
+            }
+            events.Sort(new EventOrder());
+            clicks.Sort(clickOrder);
+            int i = 0, first = 0, next = 0;
+            var initial = events[0];
             int day = Input.EpochDay(initial.Time);
             long userSessions = 0, userEvents = 0, userRevenue = 0;
 
-            while (next < clicks.Count && clicks[next].Person < person) next++;
-            first = next;
             active.Clear();
-            while (i < events.Count && events[i].Person == person)
+            while (i < eventEnd)
             {
                 long sessionStart = events[i].Time;
                 int sessionDay = Input.EpochDay(sessionStart);
@@ -344,7 +515,7 @@ sealed class Pipeline(string data, string output, int cpus)
                     int campaign = clicks[first++].Campaign;
                     if (--active[campaign] == 0) active.Remove(campaign);
                 }
-                while (next < clicks.Count && clicks[next].Person == person && clicks[next].Time <= sessionStart)
+                while (next < clickEnd && clicks[next].Time <= sessionStart)
                 {
                     var click = clicks[next++];
                     if (click.Time >= sessionStart - Input.Week)
@@ -367,7 +538,7 @@ sealed class Pipeline(string data, string output, int cpus)
                         revenue += row.Price;
                     }
                 }
-                while (i < events.Count && events[i].Person == person && events[i].Time - previous <= 1_800_000);
+                while (i < eventEnd && events[i].Time - previous <= 1_800_000);
 
                 int credited = first < next ? clicks[next - 1].Campaign : 0;
                 Accumulate(totals, (credited, day), 1, revenue > 0 ? 1 : 0, revenue, 0);
@@ -440,6 +611,3 @@ static class Program
         new Pipeline(data, output, cpus).Run();
     }
 }
-
-
-
