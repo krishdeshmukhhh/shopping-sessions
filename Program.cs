@@ -4,7 +4,8 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 
 readonly record struct Candidate(ulong Id, long Ingest, int Shard, int Index);
-readonly record struct Event(ulong Person, long Time, int Price, int Category);
+readonly record struct Event(ulong Person, long Time);
+readonly record struct PaidEvent(int Index, int Price, int Category);
 readonly record struct Purchase(long Time, int Price, int Category);
 readonly record struct Click(ulong Person, long Time, ulong Id, int Campaign);
 readonly record struct UserDay(ulong Person, int Day, long Sessions, long Events, long Revenue, int Category);
@@ -201,12 +202,13 @@ sealed class Pipeline(string data, string output, int cpus)
     private sealed class EventBuffers(int capacity)
     {
         public readonly List<Event>[] People = Buckets<Event>(capacity);
+        public readonly List<PaidEvent>[] Purchases = Buckets<PaidEvent>();
         public readonly List<Candidate>[] Ids = Buckets<Candidate>(capacity);
     }
 
     private readonly record struct Winner(ulong Id, int Worker, int Index);
 
-    private IList<List<Event>[]> LoadEvents()
+    private IList<EventBuffers> LoadEvents()
     {
         var files = Files("events").ToArray();
         long bytes = files.Sum(path => new FileInfo(path).Length);
@@ -274,7 +276,7 @@ sealed class Pipeline(string data, string output, int cpus)
             }
             foreach (var worker in workers) worker.Ids[shard] = null!;
         });
-        return workers.Select(worker => worker.People).ToArray();
+        return workers;
     }
 
     private static void Invalidate(EventBuffers worker, Candidate row)
@@ -318,7 +320,8 @@ sealed class Pipeline(string data, string output, int cpus)
             {
                 var events = buffers.People[shard];
                 index = events.Count;
-                events.Add(new Event(person, time, price, category));
+                events.Add(new Event(person, time));
+                if (price > 0) buffers.Purchases[shard].Add(new PaidEvent(index, price, category));
             }
             buffers.Ids[Shard(id)].Add(new Candidate(id, ingest, shard, index));
         }
@@ -411,17 +414,15 @@ sealed class Pipeline(string data, string output, int cpus)
         }
     }
 
-    private static (Groups<long>, Groups<Purchase>) GroupEvents(IList<List<Event>[]> sources, int shard,
+    private static (Groups<long>, Groups<Purchase>) GroupEvents(IList<EventBuffers> sources, int shard,
         Dictionary<ulong, int> people, List<ulong> names)
     {
-        var groupIds = GC.AllocateUninitializedArray<int>(sources.Sum(s => s[shard].Count));
+        var groupIds = GC.AllocateUninitializedArray<int>(sources.Sum(s => s.People[shard].Count));
         var eventCounts = new List<int>(names.Count);
-        var purchaseCounts = new List<int>(names.Count);
         CollectionsMarshal.SetCount(eventCounts, names.Count);
-        CollectionsMarshal.SetCount(purchaseCounts, names.Count);
         int position = 0;
         foreach (var source in sources)
-            foreach (ref readonly var row in CollectionsMarshal.AsSpan(source[shard]))
+            foreach (ref readonly var row in CollectionsMarshal.AsSpan(source.People[shard]))
             {
                 if (row.Person == 0) { groupIds[position++] = -1; continue; }
                 ref int group = ref CollectionsMarshal.GetValueRefOrAddDefault(people, row.Person, out bool found);
@@ -430,26 +431,42 @@ sealed class Pipeline(string data, string output, int cpus)
                     group = eventCounts.Count;
                     names.Add(row.Person);
                     eventCounts.Add(0);
-                    purchaseCounts.Add(0);
                 }
                 CollectionsMarshal.AsSpan(eventCounts)[group]++;
-                if (row.Price != 0) CollectionsMarshal.AsSpan(purchaseCounts)[group]++;
                 groupIds[position++] = group;
             }
+        var purchaseCounts = new List<int>(names.Count);
+        CollectionsMarshal.SetCount(purchaseCounts, names.Count);
+        int begin = 0;
+        foreach (var source in sources)
+        {
+            foreach (var paid in source.Purchases[shard])
+            {
+                int group = groupIds[begin + paid.Index];
+                if (group >= 0) CollectionsMarshal.AsSpan(purchaseCounts)[group]++;
+            }
+            begin += source.People[shard].Count;
+        }
         var times = AllocateGroups<long>(eventCounts);
         var purchases = AllocateGroups<Purchase>(purchaseCounts);
         position = 0;
         foreach (var source in sources)
         {
-            foreach (ref readonly var row in CollectionsMarshal.AsSpan(source[shard]))
+            begin = position;
+            var events = CollectionsMarshal.AsSpan(source.People[shard]);
+            foreach (ref readonly var row in events)
             {
                 int group = groupIds[position++];
-                if (group < 0) continue;
-                times.Rows[times.Ends[group]++] = row.Time;
-                if (row.Price != 0)
-                    purchases.Rows[purchases.Ends[group]++] = new Purchase(row.Time, row.Price, row.Category);
+                if (group >= 0) times.Rows[times.Ends[group]++] = row.Time;
             }
-            source[shard] = null!;
+            foreach (var paid in source.Purchases[shard])
+            {
+                int group = groupIds[begin + paid.Index];
+                if (group >= 0)
+                    purchases.Rows[purchases.Ends[group]++] = new Purchase(events[paid.Index].Time, paid.Price, paid.Category);
+            }
+            source.Purchases[shard] = null!;
+            source.People[shard] = null!;
         }
         return (times, purchases);
     }
